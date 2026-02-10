@@ -11,15 +11,16 @@ import cv2
 from typing import Optional, Tuple, List, Dict
 
 INPUT_DIR = "012_strawberry"
-OUTPUT_DIR = "yolo_dataset"
+OUTPUT_DIR = "output_strawberry_yolo"
 CLASS_NAME = "strawberry"
 CLASS_ID = 0
 TRAIN_SPLIT = 0.8  # 80% for training, 20% for validation
 
 DETECTION_CONFIG = {
-    'text_prompt': 'a red strawberry with green leaves',
-    'color_fallback': 'red',
-    'use_saliency': True,
+    'text_prompt': 'strawberry',
+    'color_fallback': ['red', 'green'],  # Now an array of colors
+    'color_proximity_threshold': 100,  # Maximum distance in pixels between color regions
+    'min_overlap_ratio': 0.1,  # Minimum overlap/proximity ratio required
     'owlvit_threshold': 0.05
 }
 
@@ -58,88 +59,213 @@ class ModularDetector:
 
         return [round(x, 2) for x in box], score
 
-    def detect_by_color(
-            self,
-            image: Image.Image,
-            color_name: str
-        ) -> Optional[Tuple[List[float], float]]:
-
-            color_ranges = {
-                "yellow": ((20, 100, 100), (40, 255, 255)),
-                "red": ((0, 100, 100), (10, 255, 255)),
-                "blue": ((100, 100, 100), (130, 255, 255)),
-                "green": ((40, 100, 100), (80, 255, 255)),
-                "orange": ((10, 100, 100), (25, 255, 255)),
-                "purple": ((130, 100, 100), (160, 255, 255)),
-            }
-
-            lower, upper = color_ranges.get(color_name.lower(), None)
-            if lower is None:
-                return None
-
-            cv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-            hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
-
-            mask = cv2.inRange(
-                hsv,
-                np.array(lower),
-                np.array(upper)
-            )
-
-            contours, _ = cv2.findContours(
-                mask,
-                cv2.RETR_EXTERNAL,
-                cv2.CHAIN_APPROX_SIMPLE
-            )
-
-            if not contours:
-                return None
-
-            x, y, w, h = cv2.boundingRect(
-                max(contours, key=cv2.contourArea)
-            )
-
-            return [x, y, x + w, y + h], 0.95
-
-    def detect_most_different(
-        self,
-        image: Image.Image,
-        grid_size: int = 16
-    ) -> Optional[Tuple[List[float], float]]:
-
-        cv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-        gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
-
-        lap = np.abs(cv2.Laplacian(gray, cv2.CV_64F))
-
-        h, w = gray.shape
-        cell_h, cell_w = h // grid_size, w // grid_size
-
-        best_var = 0
-        best_box = None
-
-        for i in range(grid_size):
-            for j in range(grid_size):
-                y1, y2 = i * cell_h, (i + 1) * cell_h
-                x1, x2 = j * cell_w, (j + 1) * cell_w
-                var = np.var(lap[y1:y2, x1:x2])
-
-                if var > best_var:
-                    best_var = var
-                    best_box = [x1, y1, x2, y2]
-
-        if best_box is None:
+    def get_color_mask(self, image: Image.Image, color_name: str) -> Optional[np.ndarray]:
+        """Get a binary mask for a specific color."""
+        color_ranges = {
+            "yellow": [
+                ((20, 100, 100), (40, 255, 255)),  # Bright yellow
+                ((20, 50, 50), (40, 255, 150)),     # Dark yellow
+            ],
+            "red": [
+                ((0, 100, 100), (10, 255, 255)),    # Bright red lower 
+                ((170, 100, 100), (180, 255, 255)), # Bright red upper
+                ((0, 50, 50), (10, 255, 150)),      # Dark red lower
+                ((170, 50, 50), (180, 255, 150)),   # Dark red upper
+            ],
+            "blue": [
+                ((100, 100, 100), (130, 255, 255)), # Bright blue
+                ((100, 50, 40), (130, 255, 150)),   # Dark blue
+            ],
+            "green": [
+                ((40, 100, 100), (80, 255, 255)),   # Bright green
+                ((40, 50, 40), (80, 255, 150)),     # Dark green
+            ],
+            "orange": [
+                ((10, 100, 100), (25, 255, 255)),   # Bright orange
+                ((10, 50, 50), (25, 255, 150)),     # Dark orange
+            ],
+            "purple": [
+                ((130, 100, 100), (160, 255, 255)), # Bright purple
+                ((130, 50, 40), (160, 255, 150)),   # Dark purple
+            ],
+            "grey": [
+                ((0, 0, 40), (180, 50, 200)),       # Standard grey
+                ((0, 0, 20), (180, 30, 100)),       # Dark grey
+            ],
+        }
+        
+        ranges_list = color_ranges.get(color_name.lower())
+        if ranges_list is None:
+            print(f"Warning: Color '{color_name}' not defined in color_ranges.")
             return None
+        
+        if isinstance(ranges_list, tuple) and len(ranges_list) == 2:
+            ranges_list = [ranges_list]
+        
+        # Convert PIL to OpenCV format (BGR)
+        cv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+        hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
+        
+        # Combine masks from all ranges for this color
+        combined_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        
+        for lower_hsv, upper_hsv in ranges_list:
+            mask = cv2.inRange(hsv, np.array(lower_hsv), np.array(upper_hsv))
+            combined_mask = cv2.bitwise_or(combined_mask, mask)
+        
+        return combined_mask
 
-        pad = min(cell_w, cell_h) // 2
-        x1, y1, x2, y2 = best_box
+    def detect_by_multi_color(
+        self, 
+        image: Image.Image, 
+        color_names: List[str],
+        proximity_threshold: float = 100,
+        min_overlap_ratio: float = 0.1
+    ) -> Optional[Tuple[List[float], float]]:
+        """
+        Detect objects that contain multiple colors in close proximity.
+        
+        Args:
+            image: Input image
+            color_names: List of color names to detect (e.g., ['red', 'green'])
+            proximity_threshold: Maximum distance in pixels between color regions
+            min_overlap_ratio: Minimum ratio of overlapping/nearby pixels required
+        
+        Returns:
+            Bounding box and confidence score, or None if no valid detection
+        """
+        if not color_names:
+            return None
+        
+        # Get masks for each color
+        masks = {}
+        for color in color_names:
+            mask = self.get_color_mask(image, color)
+            if mask is not None and np.any(mask):
+                masks[color] = mask
+        
+        if len(masks) < len(color_names):
+            print(f"  Not all colors found. Required: {color_names}, Found: {list(masks.keys())}")
+            return None
+        
+        # Find contours for each color
+        all_contours = {}
+        for color, mask in masks.items():
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            # Filter out tiny noise
+            valid_contours = [c for c in contours if cv2.contourArea(c) >= 100]
+            if valid_contours:
+                all_contours[color] = valid_contours
+        
+        if len(all_contours) < len(color_names):
+            return None
+        
+        # Find the best combination of contours that are close to each other
+        best_box = None
+        best_score = 0
+        
+        # Get the first color's contours as anchors
+        first_color = color_names[0]
+        for anchor_contour in all_contours[first_color]:
+            anchor_box = cv2.boundingRect(anchor_contour)
+            anchor_x, anchor_y, anchor_w, anchor_h = anchor_box
+            anchor_center = (anchor_x + anchor_w // 2, anchor_y + anchor_h // 2)
+            
+            # Check if other colors are nearby
+            nearby_contours = {first_color: anchor_contour}
+            distances = []
+            
+            for other_color in color_names[1:]:
+                min_dist = float('inf')
+                closest_contour = None
+                
+                for other_contour in all_contours[other_color]:
+                    other_box = cv2.boundingRect(other_contour)
+                    other_x, other_y, other_w, other_h = other_box
+                    other_center = (other_x + other_w // 2, other_y + other_h // 2)
+                    
+                    # Calculate distance between centers
+                    dist = np.sqrt((anchor_center[0] - other_center[0])**2 + 
+                                 (anchor_center[1] - other_center[1])**2)
+                    
+                    # Also check if boxes overlap or are very close
+                    x_overlap = max(0, min(anchor_x + anchor_w, other_x + other_w) - max(anchor_x, other_x))
+                    y_overlap = max(0, min(anchor_y + anchor_h, other_y + other_h) - max(anchor_y, other_y))
+                    overlap_area = x_overlap * y_overlap
+                    
+                    # Effective distance considering overlap
+                    effective_dist = dist if overlap_area == 0 else dist * 0.5
+                    
+                    if effective_dist < min_dist:
+                        min_dist = effective_dist
+                        closest_contour = other_contour
+                
+                if min_dist <= proximity_threshold and closest_contour is not None:
+                    nearby_contours[other_color] = closest_contour
+                    distances.append(min_dist)
+            
+            # If we found all colors nearby, create a combined bounding box
+            if len(nearby_contours) == len(color_names):
+                # Combine all contours
+                all_points = []
+                for contour in nearby_contours.values():
+                    all_points.extend(contour.reshape(-1, 2))
+                all_points = np.array(all_points)
+                
+                # Get bounding box around all points
+                x, y, w, h = cv2.boundingRect(all_points)
+                
+                # Calculate score based on proximity and size
+                avg_distance = np.mean(distances) if distances else 0
+                proximity_score = max(0, 1 - (avg_distance / proximity_threshold))
+                area_score = min(1.0, (w * h) / 10000)  # Normalize by expected max area
+                combined_score = 0.7 * proximity_score + 0.3 * area_score
+                
+                if combined_score > best_score:
+                    best_score = combined_score
+                    best_box = [float(x), float(y), float(x + w), float(y + h)]
+        
+        if best_box is not None and best_score >= min_overlap_ratio:
+            return best_box, min(0.95, best_score)
+        
+        return None
 
-        return [
-            max(0, x1 - pad),
-            max(0, y1 - pad),
-            min(w, x2 + pad),
-            min(h, y2 + pad)
-        ], 0.8
+    def detect_by_color(self, image: Image.Image, color_input) -> Optional[Tuple[List[float], float]]:
+        """
+        Detect by color(s). Supports both single color (string) and multiple colors (list).
+        
+        Args:
+            image: Input image
+            color_input: Either a string (single color) or list of strings (multiple colors)
+        
+        Returns:
+            Bounding box and confidence score, or None if no valid detection
+        """
+        # Handle both single color and multi-color cases
+        if isinstance(color_input, str):
+            # Single color - use original logic
+            mask = self.get_color_mask(image, color_input)
+            if mask is None or not np.any(mask):
+                return None
+            
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if len(contours) == 0:
+                return None
+            
+            largest = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(largest) < 100:
+                return None
+            
+            x, y, w, h = cv2.boundingRect(largest)
+            return [float(x), float(y), float(x + w), float(y + h)], 0.95
+        
+        elif isinstance(color_input, list):
+            # Multiple colors - use proximity detection
+            return self.detect_by_multi_color(image, color_input)
+        
+        else:
+            print(f"Warning: Invalid color_input type: {type(color_input)}")
+            return None
 
     def xyxy_to_xywh_norm(self, box: List[float], img_width: int, img_height: int) -> List[float]:
         x1, y1, x2, y2 = box
@@ -177,12 +303,7 @@ class ModularDetector:
         if box is None and (color := config.get("color_fallback")):
             if result := self.detect_by_color(image, color):
                 box, score = result
-                method = "color"
-
-        if box is None and config.get("use_saliency", True):
-            if result := self.detect_most_different(image):
-                box, score = result
-                method = "saliency"
+                method = f"color_{'_'.join(color) if isinstance(color, list) else color}"
 
         if box is None:
             return None
@@ -301,7 +422,7 @@ names:
 """
         with open(f"{OUTPUT_DIR}/data.yaml", "w") as f:
             f.write(yaml_content.strip())
-        print(f"✓ Created data.yaml")
+        print(f"Created data.yaml")
 
     def process_folder(self):
         image_exts = [".jpg", ".jpeg", ".png"]
@@ -345,7 +466,7 @@ names:
                 debug_image = image.copy() # Copy so we don't mess up the training image
                 self.draw_label(debug_image, box_xyxy, result["label"], result["confidence"], result["method"], os.path.join(debug_path, filename))
                                 
-                print(f"✓ Processed {filename} → {split}")
+                print(f"Processed {filename} → {split}")
         
         self.create_yaml()
         
@@ -374,7 +495,6 @@ names:
         draw.text((x1 + 2, y1 - text_height - 3), label_text, fill="white", font=font)
         
         image.save(save_path)
-        print(f"  Saved debug image to {save_path}")
 
 if __name__ == "__main__":
     labeler = YOLOLabeler()
