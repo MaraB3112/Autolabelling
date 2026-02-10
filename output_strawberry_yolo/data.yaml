@@ -1,0 +1,6 @@
+path: C:\Users\alexi\OneDrive - TU Eindhoven\Desktop\master\Year1\tech_united\Autolabelling\output_strawberry_yolo
+train: train/images
+val: val/images
+
+names:
+  0: strawberry
